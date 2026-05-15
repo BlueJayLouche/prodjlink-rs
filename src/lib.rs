@@ -1973,3 +1973,196 @@ impl ProDjLinkClient {
 
 /// Backward-compatible alias for code that used the REACT-internal name.
 pub type ProDjLinkSource = ProDjLinkClient;
+
+// ----------------------------------------------------------------------------
+// Fuzz targets
+// ----------------------------------------------------------------------------
+
+#[cfg(feature = "fuzz")]
+pub mod fuzz {
+    //! Public entry points for `cargo-fuzz`.
+    //!
+    //! Each function exercises the byte-access paths of the corresponding
+    //! private parser without requiring live network state.
+
+    use super::*;
+
+    /// Exercise CDJ status packet parsing.
+    pub fn parse_cdj_status(data: &[u8]) {
+        // Mirror the length check and field extraction from
+        // ProDjLinkClient::parse_cdj_status.
+        if data.len() < 0x7C {
+            return;
+        }
+
+        let _device_id = data[0x21];
+        let name_end = data[0x0b..0x20]
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(0x15);
+        let _name = sanitize_text(&String::from_utf8_lossy(&data[0x0b..0x0b + name_end]).trim());
+
+        let _play_mode = data[0x7B];
+        let _flags = data[0x89];
+
+        let _track_device_id = data[0x28];
+        let _track_slot = data[0x29];
+        let _track_id = u32::from_be_bytes([data[0x2C], data[0x2D], data[0x2E], data[0x2F]]);
+
+        let _bpm = if data.len() > 0x93 {
+            let bpm_raw = u16::from_be_bytes([data[0x92], data[0x93]]);
+            if bpm_raw > 0 && bpm_raw < 30000 {
+                Some(bpm_raw as f32 / 100.0)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Exercise the BPM-at-0x86 path (older firmware)
+        if _bpm.is_none() && data.len() > 0x87 {
+            let bpm_raw = u16::from_be_bytes([data[0x86], data[0x87]]);
+            if bpm_raw > 0 && bpm_raw < 30000 {
+                let _ = bpm_raw as f32 / 100.0;
+            }
+        }
+    }
+
+    /// Exercise mixer on-air packet parsing.
+    pub fn parse_mixer_on_air(data: &[u8]) {
+        if data.len() < 0x28 {
+            return;
+        }
+        let _on_air_mask = data[0x27];
+    }
+
+    /// Exercise menu (UDP) packet parsing.
+    pub fn parse_menu_packets(data: &[u8]) {
+        let packets = vec![data.to_vec()];
+        let mut title = String::new();
+        let mut artist = String::new();
+
+        for packet in &packets {
+            let mut i = 0;
+            while i < packet.len().saturating_sub(6) {
+                if packet[i] == 0x26 {
+                    if i + 5 > packet.len() {
+                        break;
+                    }
+                    let len = u32::from_be_bytes([
+                        packet[i + 1],
+                        packet[i + 2],
+                        packet[i + 3],
+                        packet[i + 4],
+                    ]) as usize;
+
+                    if len > 0 && len < 512 && i + 5 + len <= packet.len() {
+                        let utf16_data = &packet[i + 5..i + 5 + len];
+                        let mut utf16_vec = Vec::new();
+                        for chunk in utf16_data.chunks(2) {
+                            if chunk.len() == 2 {
+                                utf16_vec.push(u16::from_be_bytes([chunk[0], chunk[1]]));
+                            }
+                        }
+                        if let Ok(s) = String::from_utf16(&utf16_vec) {
+                            let s = sanitize_text(s.trim_matches('\0').trim());
+                            if !s.is_empty() {
+                                if title.is_empty() {
+                                    title = s;
+                                } else if artist.is_empty() {
+                                    artist = s;
+                                }
+                            }
+                        }
+                        i += 5 + len;
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+        }
+    }
+
+    /// Exercise render (TCP) response parsing from a byte buffer.
+    pub fn parse_render_response(data: &[u8]) {
+        let mut title = String::new();
+        let mut artist = String::new();
+
+        #[derive(Debug, Clone, Copy, PartialEq)]
+        enum ParseState {
+            WaitingForData,
+            ReceivedHeader,
+            ReceivingRows,
+            Complete,
+        }
+
+        let mut state = ParseState::WaitingForData;
+        let all_data = data;
+        let data_len = all_data.len();
+
+        if data_len >= 13 && state == ParseState::WaitingForData {
+            let msg_type = u16::from_be_bytes([all_data[11], all_data[12]]);
+            if msg_type == 0x4001 {
+                state = ParseState::ReceivedHeader;
+            }
+        }
+
+        if data_len > 13 {
+            for i in 0..data_len.saturating_sub(2) {
+                if all_data[i] == 0x42 && all_data[i + 1] == 0x01 {
+                    state = ParseState::Complete;
+                    break;
+                }
+            }
+            if state == ParseState::ReceivedHeader {
+                for i in 0..data_len.saturating_sub(2) {
+                    if all_data[i] == 0x41 && all_data[i + 1] == 0x01 {
+                        state = ParseState::ReceivingRows;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if state == ParseState::Complete || !all_data.is_empty() {
+            let mut i = 0;
+            while i < all_data.len().saturating_sub(6) {
+                if all_data[i] == 0x26 {
+                    if i + 5 > all_data.len() {
+                        break;
+                    }
+                    let len = u32::from_be_bytes([
+                        all_data[i + 1],
+                        all_data[i + 2],
+                        all_data[i + 3],
+                        all_data[i + 4],
+                    ]) as usize;
+
+                    if len > 0 && len < 512 && i + 5 + len <= all_data.len() {
+                        let utf16_data = &all_data[i + 5..i + 5 + len];
+                        let mut utf16_vec = Vec::new();
+                        for chunk in utf16_data.chunks(2) {
+                            if chunk.len() == 2 {
+                                utf16_vec.push(u16::from_be_bytes([chunk[0], chunk[1]]));
+                            }
+                        }
+                        if let Ok(s) = String::from_utf16(&utf16_vec) {
+                            let s = sanitize_text(s.trim_matches('\0').trim());
+                            if !s.is_empty() {
+                                if title.is_empty() {
+                                    title = s;
+                                } else if artist.is_empty() {
+                                    artist = s;
+                                }
+                            }
+                        }
+                        i += 5 + len;
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+        }
+    }
+}
