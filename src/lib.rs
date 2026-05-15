@@ -5,7 +5,7 @@
 //!
 //! Protocol documentation: https://djl-analysis.deepsymmetry.org/
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -65,7 +65,7 @@ const DB_MAGIC: [u8; 4] = [0x87, 0x23, 0x49, 0xae];
 pub struct ProDjLinkClient {
     state: Arc<Mutex<ProDjLinkState>>,
     /// Separate lock for track history to avoid blocking render thread
-    track_history: Arc<Mutex<Vec<TrackChangeRecord>>>,
+    track_history: Arc<Mutex<VecDeque<TrackChangeRecord>>>,
     listener_thread: Option<JoinHandle<()>>,
     running: Arc<AtomicBool>,
 }
@@ -87,7 +87,7 @@ struct ProDjLinkState {
     /// Last error message for diagnostics
     last_error: Option<String>,
     /// Pending metadata UDP packets (type=0x40) with source IP for filtering
-    pending_metadata_packets: Vec<PendingUdpPacket>,
+    pending_metadata_packets: VecDeque<PendingUdpPacket>,
     /// Our virtual device ID (dynamically selected to avoid conflicts)
     our_device_id: u8,
     /// Last track change time per device for debouncing fetches
@@ -167,11 +167,11 @@ impl ProDjLinkClient {
             metadata_cache: HashMap::new(),
             pending_fetches: std::collections::HashSet::new(),
             last_error: None,
-            pending_metadata_packets: Vec::new(),
+            pending_metadata_packets: VecDeque::new(),
             our_device_id: 6, // Will be updated after network scan
             last_track_change: HashMap::new(),
         }));
-        let track_history = Arc::new(Mutex::new(Vec::new()));
+        let track_history = Arc::new(Mutex::new(VecDeque::new()));
         let running = Arc::new(AtomicBool::new(true));
 
         let thread_state = state.clone();
@@ -349,7 +349,7 @@ impl ProDjLinkClient {
     /// Main listener loop - joins network and receives UDP packets
     fn listener_loop(
         state: Arc<Mutex<ProDjLinkState>>,
-        track_history: Arc<Mutex<Vec<TrackChangeRecord>>>,
+        track_history: Arc<Mutex<VecDeque<TrackChangeRecord>>>,
         running: Arc<AtomicBool>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         use socket2::{Domain, Protocol, Socket, Type};
@@ -542,9 +542,9 @@ impl ProDjLinkClient {
                             {
                                 let mut s = state.lock();
                                 if s.pending_metadata_packets.len() > 50 {
-                                    s.pending_metadata_packets.remove(0);
+                                    s.pending_metadata_packets.pop_front();
                                 }
-                                s.pending_metadata_packets.push(PendingUdpPacket {
+                                s.pending_metadata_packets.push_back(PendingUdpPacket {
                                     data: buf[..len].to_vec(),
                                     source_ip: src.ip(),
                                     device_id: source_device_id,
@@ -671,7 +671,7 @@ impl ProDjLinkClient {
         data: &[u8],
         src_ip: IpAddr,
         state: &Arc<Mutex<ProDjLinkState>>,
-        track_history: &Arc<Mutex<Vec<TrackChangeRecord>>>,
+        track_history: &Arc<Mutex<VecDeque<TrackChangeRecord>>>,
     ) {
         // CDJ status packets vary in length - minimum ~0x7C needed for basic info
         if data.len() < 0x7C {
@@ -807,9 +807,9 @@ impl ProDjLinkClient {
             // Use separate lock for track history - doesn't block state access
             let mut history = track_history.lock();
             if history.len() >= 100 {
-                history.remove(0);
+                history.pop_front();
             }
-            history.push(record);
+            history.push_back(record);
         }
 
         // Log new device discovery (outside of any lock)
@@ -1701,12 +1701,12 @@ impl ProDjLinkClient {
 
     /// Get all track changes since last drain (for database sync)
     /// This returns and clears the track history - uses separate lock for non-blocking
-    pub fn drain_track_history(&self) -> Vec<TrackChangeRecord> {
+    pub fn drain_track_history(&self) -> VecDeque<TrackChangeRecord> {
         std::mem::take(&mut *self.track_history.lock())
     }
 
     /// Get track history without clearing (for inspection)
-    pub fn get_track_history(&self) -> Vec<TrackChangeRecord> {
+    pub fn get_track_history(&self) -> VecDeque<TrackChangeRecord> {
         self.track_history.lock().clone()
     }
 
