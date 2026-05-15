@@ -253,9 +253,7 @@ impl ProDjLinkClient {
 
     /// Get the local IP address for the interface that can reach the broadcast network
     fn get_local_ip() -> Option<[u8; 4]> {
-        // Try to find a suitable local IP by connecting to a broadcast-capable route
         let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-        // Connect to a local broadcast address to determine our interface
         socket.connect("10.255.255.255:1").ok()?;
         let local_addr = socket.local_addr().ok()?;
         if let IpAddr::V4(ip) = local_addr.ip() {
@@ -265,9 +263,33 @@ impl ProDjLinkClient {
         }
     }
 
+    /// Compute the directed broadcast address for the interface that owns
+    /// `local_ip`, using the real netmask from `if-addrs`.  Falls back to a
+    /// /24 assumption if the interface cannot be found.
+    fn compute_broadcast(local_ip: &[u8; 4]) -> [u8; 4] {
+        use std::net::Ipv4Addr;
+        let target = Ipv4Addr::from(*local_ip);
+
+        if let Ok(ifaces) = if_addrs::get_if_addrs() {
+            for iface in ifaces {
+                if let if_addrs::IfAddr::V4(v4) = iface.addr {
+                    if v4.ip == target {
+                        let ip   = u32::from(v4.ip);
+                        let mask = u32::from(v4.netmask);
+                        let bcast = Ipv4Addr::from(ip | !mask);
+                        return bcast.octets();
+                    }
+                }
+            }
+        }
+
+        // Fallback: /24
+        log::warn!("[ProDjLink] Could not find netmask for {}, assuming /24 broadcast", target);
+        [local_ip[0], local_ip[1], local_ip[2], 255]
+    }
+
     /// Get a pseudo-MAC address (use local IP + fixed bytes for uniqueness)
     fn get_pseudo_mac(local_ip: &[u8; 4]) -> [u8; 6] {
-        // Create a unique-ish MAC: 02:xx:xx:IP:IP:IP (02 = locally administered)
         [0x02, 0xC0, 0x11, local_ip[1], local_ip[2], local_ip[3]]
     }
 
@@ -428,17 +450,22 @@ impl ProDjLinkClient {
             local_mac[0], local_mac[1], local_mac[2], local_mac[3], local_mac[4], local_mac[5]
         );
 
-        // Calculate broadcast address (assume /24 network)
-        let broadcast_ip = [local_ip[0], local_ip[1], local_ip[2], 255];
+        // Compute the correct broadcast address using the real netmask.
+        let broadcast_ip = Self::compute_broadcast(&local_ip);
         let broadcast_addr: SocketAddr = format!(
             "{}.{}.{}.{}:50000",
             broadcast_ip[0], broadcast_ip[1], broadcast_ip[2], broadcast_ip[3]
         ).parse()?;
 
-        // Create socket for sending keep-alives (port 50000)
+        log::info!("[ProDjLink] Broadcast address: {}.{}.{}.{}",
+            broadcast_ip[0], broadcast_ip[1], broadcast_ip[2], broadcast_ip[3]);
+
+        // Announce socket: bind 0.0.0.0:50000 so we can also receive keep-alives
+        // from CDJs on the same port, then send keep-alives to the broadcast address.
         let announce_socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
         announce_socket.set_reuse_address(true)?;
         announce_socket.set_broadcast(true)?;
+        announce_socket.set_multicast_loop_v4(false)?;
         #[cfg(unix)]
         {
             announce_socket.set_reuse_port(true)?;
@@ -452,8 +479,8 @@ impl ProDjLinkClient {
         }
         let announce_socket: UdpSocket = announce_socket.into();
 
-        // Create socket to RECEIVE status packets on port 50002
-        // CDJs will send status directly to us once they see our keep-alives
+        // Status socket: bind to the specific local interface address on port 50002
+        // so packets arriving on other interfaces (VPN, etc.) are not accepted.
         let status_socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
         status_socket.set_reuse_address(true)?;
         status_socket.set_nonblocking(true)?;
@@ -461,14 +488,23 @@ impl ProDjLinkClient {
         {
             status_socket.set_reuse_port(true)?;
         }
-        let status_bind: SocketAddr = "0.0.0.0:50002".parse()?;
+        let status_bind: SocketAddr = format!(
+            "{}.{}.{}.{}:50002",
+            local_ip[0], local_ip[1], local_ip[2], local_ip[3]
+        ).parse()?;
         match status_socket.bind(&status_bind.into()) {
-            Ok(_) => log::info!("[ProDjLink] Bound to UDP port 50002 (receiving CDJ status)"),
+            Ok(_) => log::info!("[ProDjLink] Bound to {}:{} (receiving CDJ status)",
+                status_bind.ip(), status_bind.port()),
             Err(e) => {
-                let msg = format!("Failed to bind port 50002: {} (rekordbox running?)", e);
-                log::warn!("[ProDjLink] {}", msg);
-                state.lock().last_error = Some(msg);
-                return Ok(());
+                // Fall back to 0.0.0.0 if the specific-IP bind fails (e.g. IP changed).
+                log::warn!("[ProDjLink] Could not bind status socket to local IP ({}), falling back to 0.0.0.0: {}", status_bind.ip(), e);
+                let fallback: SocketAddr = "0.0.0.0:50002".parse()?;
+                if let Err(e2) = status_socket.bind(&fallback.into()) {
+                    let msg = format!("Failed to bind port 50002: {} (rekordbox running?)", e2);
+                    log::warn!("[ProDjLink] {}", msg);
+                    state.lock().last_error = Some(msg);
+                    return Ok(());
+                }
             }
         }
         let status_socket: UdpSocket = status_socket.into();
@@ -1036,6 +1072,12 @@ impl ProDjLinkClient {
         stream.read_exact(&mut resp).ok()?;
         let port = u16::from_be_bytes(resp);
 
+        // Reject implausible ports: < 1024 is privileged, > 49151 is ephemeral.
+        if port < 1024 || port > 49151 {
+            log::warn!("[ProDjLink] dbserver port {} out of valid range (1024–49151), ignoring", port);
+            return None;
+        }
+
         log::info!("[ProDjLink] Discovered dbserver port: {}", port);
         Some(port)
     }
@@ -1428,9 +1470,6 @@ impl ProDjLinkClient {
     /// Protocol: 0x4001 header, 0x4101 rows (with metadata), 0x4201 footer
     /// Uses timeout streak (2-3 timeouts) not single timeout to handle bursty data
     fn parse_render_response(stream: &mut TcpStream) -> Option<TrackMetadata> {
-        let mut title = String::new();
-        let mut artist = String::new();
-
         // State machine for parsing streamed render responses
         #[derive(Debug, Clone, Copy, PartialEq)]
         enum ParseState {
@@ -1522,8 +1561,6 @@ impl ProDjLinkClient {
         }
 
         let total_read = all_data.len();
-
-        // Log framing info + first 64 bytes (not full dump)
         if total_read >= 15 {
             let txid = u32::from_be_bytes([all_data[6], all_data[7], all_data[8], all_data[9]]);
             let msg_type = u16::from_be_bytes([all_data[11], all_data[12]]);
@@ -1535,8 +1572,19 @@ impl ProDjLinkClient {
             log::info!("[ProDjLink] TCP render: {} bytes (too short for header)", total_read);
         }
 
-        // Scan through all data looking for UTF-16BE strings (0x26 prefix)
-        // StringField format: 0x26 + 4-byte length (in UTF-16 chars, not bytes!) + UTF-16BE data
+        Self::parse_render_response_from_bytes(&all_data)
+    }
+
+    /// Extract track metadata from a raw render-response byte buffer.
+    ///
+    /// Shared by the live TCP path and the fuzz harness so both exercise the
+    /// same code.
+    fn parse_render_response_from_bytes(all_data: &[u8]) -> Option<TrackMetadata> {
+        let mut title  = String::new();
+        let mut artist = String::new();
+        let total_read = all_data.len();
+
+        // Scan for UTF-16BE strings (StringField: 0x26 + 4-byte char-count + UTF-16BE data)
         let mut i = 0;
         while i < total_read.saturating_sub(6) {
             if all_data[i] == 0x26 {
@@ -1551,13 +1599,10 @@ impl ProDjLinkClient {
                     all_data[i + 4],
                 ]) as usize;
 
-                // Convert character count to byte count (UTF-16 = 2 bytes per char)
                 let byte_len = char_len * 2;
 
                 if char_len > 0 && byte_len < 1024 && i + 5 + byte_len <= total_read {
                     let utf16_data = &all_data[i + 5..i + 5 + byte_len];
-
-                    // Convert UTF-16BE to String
                     let mut utf16_vec = Vec::new();
                     for chunk in utf16_data.chunks(2) {
                         if chunk.len() == 2 {
@@ -1569,7 +1614,6 @@ impl ProDjLinkClient {
                         let s = sanitize_text(s.trim_matches('\0').trim());
                         if !s.is_empty() {
                             log::debug!("[ProDjLink] Found string (len={}): \"{}\"", char_len, s);
-                            // First non-empty string is typically title, second is artist
                             if title.is_empty() {
                                 title = s;
                             } else if artist.is_empty() {
@@ -1593,11 +1637,7 @@ impl ProDjLinkClient {
 
         Some(TrackMetadata {
             title,
-            artist: if artist.is_empty() {
-                "Unknown Artist".to_string()
-            } else {
-                artist
-            },
+            artist: if artist.is_empty() { "Unknown Artist".to_string() } else { artist },
             album: None,
             duration: None,
             fetched_at: Instant::now(),
@@ -1982,187 +2022,49 @@ pub type ProDjLinkSource = ProDjLinkClient;
 pub mod fuzz {
     //! Public entry points for `cargo-fuzz`.
     //!
-    //! Each function exercises the byte-access paths of the corresponding
-    //! private parser without requiring live network state.
+    //! Each function calls the **real** parser — not a shadow copy — so the
+    //! fuzz corpus exercises the exact code paths that run in production.
 
     use super::*;
+    use std::collections::VecDeque;
+    use std::net::IpAddr;
 
-    /// Exercise CDJ status packet parsing.
+    fn make_fuzz_state() -> Arc<Mutex<ProDjLinkState>> {
+        Arc::new(Mutex::new(ProDjLinkState {
+            devices:                  HashMap::new(),
+            metadata_cache:           HashMap::new(),
+            pending_fetches:          std::collections::HashSet::new(),
+            last_error:               None,
+            pending_metadata_packets: VecDeque::new(),
+            // Use ID 7 — outside the valid CDJ range 1–6 so our own packets
+            // are filtered (device_id == our_id check inside parse_cdj_status).
+            our_device_id:            7,
+            last_track_change:        HashMap::new(),
+        }))
+    }
+
+    /// Fuzz the CDJ status packet parser (real implementation).
     pub fn parse_cdj_status(data: &[u8]) {
-        // Mirror the length check and field extraction from
-        // ProDjLinkClient::parse_cdj_status.
-        if data.len() < 0x7C {
-            return;
-        }
-
-        let _device_id = data[0x21];
-        let name_end = data[0x0b..0x20]
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(0x15);
-        let _name = sanitize_text(&String::from_utf8_lossy(&data[0x0b..0x0b + name_end]).trim());
-
-        let _play_mode = data[0x7B];
-        let _flags = data[0x89];
-
-        let _track_device_id = data[0x28];
-        let _track_slot = data[0x29];
-        let _track_id = u32::from_be_bytes([data[0x2C], data[0x2D], data[0x2E], data[0x2F]]);
-
-        let _bpm = if data.len() > 0x93 {
-            let bpm_raw = u16::from_be_bytes([data[0x92], data[0x93]]);
-            if bpm_raw > 0 && bpm_raw < 30000 {
-                Some(bpm_raw as f32 / 100.0)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        // Exercise the BPM-at-0x86 path (older firmware)
-        if _bpm.is_none() && data.len() > 0x87 {
-            let bpm_raw = u16::from_be_bytes([data[0x86], data[0x87]]);
-            if bpm_raw > 0 && bpm_raw < 30000 {
-                let _ = bpm_raw as f32 / 100.0;
-            }
-        }
+        let state        = make_fuzz_state();
+        let track_history = Arc::new(Mutex::new(VecDeque::new()));
+        let snapshot     = Arc::new(RwLock::new(Arc::new(ProDjSnapshot::default())));
+        let src_ip: IpAddr = "192.168.1.100".parse().unwrap();
+        ProDjLinkClient::parse_cdj_status(data, src_ip, &state, &track_history, &snapshot);
     }
 
-    /// Exercise mixer on-air packet parsing.
+    /// Fuzz the mixer on-air packet parser (real implementation).
     pub fn parse_mixer_on_air(data: &[u8]) {
-        if data.len() < 0x28 {
-            return;
-        }
-        let _on_air_mask = data[0x27];
+        let state = make_fuzz_state();
+        ProDjLinkClient::parse_mixer_on_air(data, &state);
     }
 
-    /// Exercise menu (UDP) packet parsing.
+    /// Fuzz the menu (UDP metadata) packet parser (real implementation).
     pub fn parse_menu_packets(data: &[u8]) {
-        let packets = vec![data.to_vec()];
-        let mut title = String::new();
-        let mut artist = String::new();
-
-        for packet in &packets {
-            let mut i = 0;
-            while i < packet.len().saturating_sub(6) {
-                if packet[i] == 0x26 {
-                    if i + 5 > packet.len() {
-                        break;
-                    }
-                    let len = u32::from_be_bytes([
-                        packet[i + 1],
-                        packet[i + 2],
-                        packet[i + 3],
-                        packet[i + 4],
-                    ]) as usize;
-
-                    if len > 0 && len < 512 && i + 5 + len <= packet.len() {
-                        let utf16_data = &packet[i + 5..i + 5 + len];
-                        let mut utf16_vec = Vec::new();
-                        for chunk in utf16_data.chunks(2) {
-                            if chunk.len() == 2 {
-                                utf16_vec.push(u16::from_be_bytes([chunk[0], chunk[1]]));
-                            }
-                        }
-                        if let Ok(s) = String::from_utf16(&utf16_vec) {
-                            let s = sanitize_text(s.trim_matches('\0').trim());
-                            if !s.is_empty() {
-                                if title.is_empty() {
-                                    title = s;
-                                } else if artist.is_empty() {
-                                    artist = s;
-                                }
-                            }
-                        }
-                        i += 5 + len;
-                        continue;
-                    }
-                }
-                i += 1;
-            }
-        }
+        let _ = ProDjLinkClient::parse_menu_packets(&[data.to_vec()]);
     }
 
-    /// Exercise render (TCP) response parsing from a byte buffer.
+    /// Fuzz the render (TCP) response byte parser (real implementation).
     pub fn parse_render_response(data: &[u8]) {
-        let mut title = String::new();
-        let mut artist = String::new();
-
-        #[derive(Debug, Clone, Copy, PartialEq)]
-        enum ParseState {
-            WaitingForData,
-            ReceivedHeader,
-            ReceivingRows,
-            Complete,
-        }
-
-        let mut state = ParseState::WaitingForData;
-        let all_data = data;
-        let data_len = all_data.len();
-
-        if data_len >= 13 && state == ParseState::WaitingForData {
-            let msg_type = u16::from_be_bytes([all_data[11], all_data[12]]);
-            if msg_type == 0x4001 {
-                state = ParseState::ReceivedHeader;
-            }
-        }
-
-        if data_len > 13 {
-            for i in 0..data_len.saturating_sub(2) {
-                if all_data[i] == 0x42 && all_data[i + 1] == 0x01 {
-                    state = ParseState::Complete;
-                    break;
-                }
-            }
-            if state == ParseState::ReceivedHeader {
-                for i in 0..data_len.saturating_sub(2) {
-                    if all_data[i] == 0x41 && all_data[i + 1] == 0x01 {
-                        state = ParseState::ReceivingRows;
-                        break;
-                    }
-                }
-            }
-        }
-
-        if state == ParseState::Complete || !all_data.is_empty() {
-            let mut i = 0;
-            while i < all_data.len().saturating_sub(6) {
-                if all_data[i] == 0x26 {
-                    if i + 5 > all_data.len() {
-                        break;
-                    }
-                    let len = u32::from_be_bytes([
-                        all_data[i + 1],
-                        all_data[i + 2],
-                        all_data[i + 3],
-                        all_data[i + 4],
-                    ]) as usize;
-
-                    if len > 0 && len < 512 && i + 5 + len <= all_data.len() {
-                        let utf16_data = &all_data[i + 5..i + 5 + len];
-                        let mut utf16_vec = Vec::new();
-                        for chunk in utf16_data.chunks(2) {
-                            if chunk.len() == 2 {
-                                utf16_vec.push(u16::from_be_bytes([chunk[0], chunk[1]]));
-                            }
-                        }
-                        if let Ok(s) = String::from_utf16(&utf16_vec) {
-                            let s = sanitize_text(s.trim_matches('\0').trim());
-                            if !s.is_empty() {
-                                if title.is_empty() {
-                                    title = s;
-                                } else if artist.is_empty() {
-                                    artist = s;
-                                }
-                            }
-                        }
-                        i += 5 + len;
-                        continue;
-                    }
-                }
-                i += 1;
-            }
-        }
+        let _ = ProDjLinkClient::parse_render_response_from_bytes(data);
     }
 }
