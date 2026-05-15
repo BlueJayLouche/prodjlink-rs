@@ -15,3 +15,17 @@ jobs:
       - run: cargo check --examples
       - run: cargo check --features serde
       - run: cargo clippy --all-targets --features serde -- -D warnings
+      - name: Security audit
+        run: |
+          cargo install cargo-audit --quiet
+          cargo audit
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --quiet
+      - name: Fuzz CDJ status parser
+        run: cargo fuzz run fuzz_cdj_status -- -max_total_time=60
+      - name: Fuzz mixer on-air parser
+        run: cargo fuzz run fuzz_mixer_on_air -- -max_total_time=60
+      - name: Fuzz menu packet parser
+        run: cargo fuzz run fuzz_menu_packets -- -max_total_time=60
+      - name: Fuzz render response parser
+        run: cargo fuzz run fuzz_render_response -- -max_total_time=60

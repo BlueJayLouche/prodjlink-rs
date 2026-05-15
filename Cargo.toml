@@ -14,7 +14,8 @@ categories = ["network-programming", "multimedia"]
 [dependencies]
 log = "0.4"
 parking_lot = "0.12"
-socket2 = "0.5"
+socket2 = { version = "0.5", features = ["all"] }
+if-addrs = "0.13"
 serde = { version = "1.0", features = ["derive"], optional = true }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -22,6 +23,7 @@ libc = "0.2"
 [features]
 default = []
 serde = ["dep:serde"]
+fuzz = []
 
 [dev-dependencies]
 env_logger = "0.11"

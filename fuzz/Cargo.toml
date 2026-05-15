@@ -1,0 +1,39 @@
+[package]
+name = "prodjlink-rs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.prodjlink-rs]
+path = ".."
+features = ["fuzz"]
+
+[[bin]]
+name = "fuzz_cdj_status"
+path = "fuzz_targets/fuzz_cdj_status.rs"
+test = false
+codegen-units = 1
+
+[[bin]]
+name = "fuzz_mixer_on_air"
+path = "fuzz_targets/fuzz_mixer_on_air.rs"
+test = false
+codegen-units = 1
+
+[[bin]]
+name = "fuzz_menu_packets"
+path = "fuzz_targets/fuzz_menu_packets.rs"
+test = false
+codegen-units = 1
+
+[[bin]]
+name = "fuzz_render_response"
+path = "fuzz_targets/fuzz_render_response.rs"
+test = false
+codegen-units = 1
