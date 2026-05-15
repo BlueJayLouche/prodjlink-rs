@@ -385,14 +385,7 @@ impl ProDjLinkClient {
         announce_socket.set_broadcast(true)?;
         #[cfg(unix)]
         {
-            use std::os::unix::io::AsRawFd;
-            let fd = announce_socket.as_raw_fd();
-            unsafe {
-                let optval: libc::c_int = 1;
-                libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEPORT,
-                    &optval as *const _ as *const libc::c_void,
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t);
-            }
+            announce_socket.set_reuse_port(true)?;
         }
         let announce_bind: SocketAddr = "0.0.0.0:50000".parse()?;
         match announce_socket.bind(&announce_bind.into()) {
@@ -410,14 +403,7 @@ impl ProDjLinkClient {
         status_socket.set_nonblocking(true)?;
         #[cfg(unix)]
         {
-            use std::os::unix::io::AsRawFd;
-            let fd = status_socket.as_raw_fd();
-            unsafe {
-                let optval: libc::c_int = 1;
-                libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEPORT,
-                    &optval as *const _ as *const libc::c_void,
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t);
-            }
+            status_socket.set_reuse_port(true)?;
         }
         let status_bind: SocketAddr = "0.0.0.0:50002".parse()?;
         match status_socket.bind(&status_bind.into()) {
