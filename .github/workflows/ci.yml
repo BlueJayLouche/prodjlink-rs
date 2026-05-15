@@ -15,3 +15,7 @@ jobs:
       - run: cargo check --examples
       - run: cargo check --features serde
       - run: cargo clippy --all-targets --features serde -- -D warnings
+      - name: Security audit
+        run: |
+          cargo install cargo-audit --quiet
+          cargo audit

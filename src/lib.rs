@@ -18,6 +18,30 @@ use parking_lot::{Mutex, RwLock};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
+/// Sanitize a string decoded from an untrusted LAN packet before exposing it to callers.
+///
+/// Strips ASCII control characters, Unicode bidi override codepoints, and HTML metacharacters
+/// (replacing the latter with entities). Consumers must still treat all string fields as
+/// attacker-controlled and never pass them to an HTML `innerHTML` sink without escaping.
+fn sanitize_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c as u32 {
+            0x00..=0x1F | 0x7F => {}
+            0x202A..=0x202E | 0x2066..=0x2069 | 0x200F | 0x061C => {}
+            _ => match c {
+                '<'  => out.push_str("&lt;"),
+                '>'  => out.push_str("&gt;"),
+                '&'  => out.push_str("&amp;"),
+                '"'  => out.push_str("&quot;"),
+                '\'' => out.push_str("&#x27;"),
+                c    => out.push(c),
+            },
+        }
+    }
+    out
+}
+
 /// CDJ device information for display or integration layers.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -608,7 +632,7 @@ impl ProDjLinkClient {
                         // Device name: bytes 0x0c to 0x1f (12-31), 20 bytes max
                         let name_bytes = &buf[0x0c..0x20.min(len)];
                         let name_end = name_bytes.iter().position(|&b| b == 0).unwrap_or(name_bytes.len());
-                        let name = String::from_utf8_lossy(&name_bytes[..name_end]).trim().to_string();
+                        let name = sanitize_text(&String::from_utf8_lossy(&name_bytes[..name_end]).trim());
 
                         if peer_id != device_id && (1..=6).contains(&peer_id) {
                             let mut st = state.lock();
@@ -848,9 +872,7 @@ impl ProDjLinkClient {
             .iter()
             .position(|&b| b == 0)
             .unwrap_or(0x15);
-        let name = String::from_utf8_lossy(&data[0x0b..0x0b + name_end])
-            .trim()
-            .to_string();
+        let name = sanitize_text(&String::from_utf8_lossy(&data[0x0b..0x0b + name_end]).trim());
 
         // P1 (byte 0x7B) - playback mode:
         // 0x00 = No track, 0x02 = Stopped, 0x03 = Playing, 0x04 = Playing loop,
@@ -1226,7 +1248,7 @@ impl ProDjLinkClient {
                         }
 
                         if let Ok(s) = String::from_utf16(&utf16_vec) {
-                            let s = s.trim_matches('\0').trim().to_string();
+                            let s = sanitize_text(s.trim_matches('\0').trim());
                             if !s.is_empty() {
                                 // First non-empty string is typically title, second is artist
                                 if title.is_empty() {
@@ -1544,7 +1566,7 @@ impl ProDjLinkClient {
                     }
 
                     if let Ok(s) = String::from_utf16(&utf16_vec) {
-                        let s = s.trim_matches('\0').trim().to_string();
+                        let s = sanitize_text(s.trim_matches('\0').trim());
                         if !s.is_empty() {
                             log::debug!("[ProDjLink] Found string (len={}): \"{}\"", char_len, s);
                             // First non-empty string is typically title, second is artist
