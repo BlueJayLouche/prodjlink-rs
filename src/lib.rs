@@ -8,7 +8,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -68,6 +68,8 @@ pub struct ProDjLinkClient {
     track_history: Arc<Mutex<VecDeque<TrackChangeRecord>>>,
     listener_thread: Option<JoinHandle<()>>,
     running: Arc<AtomicBool>,
+    /// Number of active metadata-fetch threads (capped at 4).
+    fetch_thread_count: Arc<AtomicUsize>,
 }
 
 /// Pending UDP packet with source info for filtering
@@ -92,6 +94,15 @@ struct ProDjLinkState {
     our_device_id: u8,
     /// Last track change time per device for debouncing fetches
     last_track_change: HashMap<u8, Instant>,
+}
+
+/// Helper that decrements an AtomicUsize on drop.
+struct DecrementOnDrop<'a>(&'a AtomicUsize);
+
+impl<'a> Drop for DecrementOnDrop<'a> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// Record of a track change on a deck (for database registration)
@@ -173,6 +184,7 @@ impl ProDjLinkClient {
         }));
         let track_history = Arc::new(Mutex::new(VecDeque::new()));
         let running = Arc::new(AtomicBool::new(true));
+        let fetch_thread_count = Arc::new(AtomicUsize::new(0));
 
         let thread_state = state.clone();
         let thread_track_history = track_history.clone();
@@ -194,6 +206,7 @@ impl ProDjLinkClient {
             track_history,
             listener_thread: Some(listener_thread),
             running,
+            fetch_thread_count,
         }
     }
 
@@ -1420,6 +1433,14 @@ impl ProDjLinkClient {
     fn start_metadata_fetch(&self, device_ip: IpAddr, key: MetadataKey, source_device_id: u8) {
         // Debounce delay in ms - CDJs can be mid-load when we first see track change
         const DEBOUNCE_DELAY_MS: u64 = 300;
+        const MAX_FETCH_THREADS: usize = 4;
+        const MAX_PENDING_FETCHES: usize = 32;
+
+        // Reject if we're already at the thread limit
+        if self.fetch_thread_count.load(Ordering::Relaxed) >= MAX_FETCH_THREADS {
+            log::trace!("[ProDjLink] Dropping metadata fetch for track {}: thread cap reached", key.track_id);
+            return;
+        }
 
         {
             let state = self.state.lock();
@@ -1440,15 +1461,24 @@ impl ProDjLinkClient {
         // Insert pending after debounce check
         {
             let mut state = self.state.lock();
+            if state.pending_fetches.len() >= MAX_PENDING_FETCHES {
+                log::trace!("[ProDjLink] Dropping metadata fetch for track {}: pending cap reached", key.track_id);
+                return;
+            }
             state.pending_fetches.insert(key.clone());
         }
 
+        self.fetch_thread_count.fetch_add(1, Ordering::Relaxed);
         let state = self.state.clone();
         let key_clone = key.clone();
+        let thread_count = self.fetch_thread_count.clone();
 
         thread::Builder::new()
             .name(format!("prodjlink-metadata-{}", key.track_id))
             .spawn(move || {
+                // Ensure count is decremented on all exit paths
+                let _decrement_on_drop = DecrementOnDrop(&thread_count);
+
                 log::debug!(
                     "[ProDjLink] Fetching metadata for track {} from {}",
                     key.track_id, device_ip
