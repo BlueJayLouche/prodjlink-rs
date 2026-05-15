@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -70,6 +70,8 @@ pub struct ProDjLinkClient {
     running: Arc<AtomicBool>,
     /// Number of active metadata-fetch threads (capped at 4).
     fetch_thread_count: Arc<AtomicUsize>,
+    /// Lock-free snapshot updated whenever state changes.
+    snapshot: Arc<RwLock<Arc<ProDjSnapshot>>>,
 }
 
 /// Pending UDP packet with source info for filtering
@@ -103,6 +105,17 @@ impl<'a> Drop for DecrementOnDrop<'a> {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::Relaxed);
     }
+}
+
+/// Lightweight snapshot of ProDJ Link state for lock-free frame-path reads.
+#[derive(Clone, Default, Debug)]
+pub struct ProDjSnapshot {
+    /// Visible CDJ devices with metadata.
+    pub devices: Vec<CdjDeviceInfo>,
+    /// Master deck BPM, if available.
+    pub master_bpm: Option<f32>,
+    /// Current master deck track, if available.
+    pub current_track: Option<TrackInfo>,
 }
 
 /// Record of a track change on a deck (for database registration)
@@ -185,15 +198,18 @@ impl ProDjLinkClient {
         let track_history = Arc::new(Mutex::new(VecDeque::new()));
         let running = Arc::new(AtomicBool::new(true));
         let fetch_thread_count = Arc::new(AtomicUsize::new(0));
+        let snapshot = Arc::new(RwLock::new(Arc::new(ProDjSnapshot::default())));
 
         let thread_state = state.clone();
         let thread_track_history = track_history.clone();
         let thread_running = running.clone();
+        let thread_snapshot = snapshot.clone();
+        let thread_fetch_count = fetch_thread_count.clone();
 
         let listener_thread = thread::Builder::new()
             .name("prodjlink-listener".to_string())
             .spawn(move || {
-                if let Err(e) = Self::listener_loop(thread_state, thread_track_history, thread_running) {
+                if let Err(e) = Self::listener_loop(thread_state, thread_track_history, thread_running, thread_snapshot, thread_fetch_count) {
                     log::error!("[ProDjLink] Listener error: {}", e);
                 }
             })
@@ -207,6 +223,7 @@ impl ProDjLinkClient {
             listener_thread: Some(listener_thread),
             running,
             fetch_thread_count,
+            snapshot,
         }
     }
 
@@ -364,6 +381,8 @@ impl ProDjLinkClient {
         state: Arc<Mutex<ProDjLinkState>>,
         track_history: Arc<Mutex<VecDeque<TrackChangeRecord>>>,
         running: Arc<AtomicBool>,
+        snapshot: Arc<RwLock<Arc<ProDjSnapshot>>>,
+        fetch_thread_count: Arc<AtomicUsize>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         use socket2::{Domain, Protocol, Socket, Type};
 
@@ -494,6 +513,7 @@ impl ProDjLinkClient {
         let mut last_announce = Instant::now() - Duration::from_secs(10); // Trigger immediate announce
         let mut last_status = Instant::now() - Duration::from_secs(10); // Trigger immediate status
         let mut last_prune = Instant::now();
+        let mut last_fetch_check = Instant::now();
         let mut packet_counter: u8 = 0;
 
         log::info!("[ProDjLink] Joining Pro DJ Link network as '{}' (ID {})...", device_name, device_id);
@@ -548,7 +568,7 @@ impl ProDjLinkClient {
 
                         if packet_type == PACKET_TYPE_CDJ_STATUS {
                             // Full CDJ status packet (type 0x0a) - most common, don't log
-                            Self::parse_cdj_status(&buf[..len], src.ip(), &state, &track_history);
+                            Self::parse_cdj_status(&buf[..len], src.ip(), &state, &track_history, &snapshot);
                         } else if packet_type == 0x40 {
                             // Type 0x40: mixer on-air status - store with source info for filtering
                             let source_device_id = if len >= 0x22 { buf[0x21] } else { 0 };
@@ -623,6 +643,12 @@ impl ProDjLinkClient {
                 }
             }
 
+            // Trigger metadata fetches for any loaded tracks missing metadata
+            if last_fetch_check.elapsed() > Duration::from_millis(500) {
+                Self::trigger_pending_fetches(&state, &fetch_thread_count, &snapshot);
+                last_fetch_check = Instant::now();
+            }
+
             // Prune stale devices every 2 seconds
             if last_prune.elapsed() > Duration::from_secs(2) {
                 let mut state = state.lock();
@@ -679,12 +705,130 @@ impl ProDjLinkClient {
         }
     }
 
+    /// Build a snapshot from the current locked state.
+    fn build_snapshot(state: &ProDjLinkState) -> ProDjSnapshot {
+        let our_id = state.our_device_id;
+
+        let mut devices: Vec<CdjDeviceInfo> = vec![CdjDeviceInfo {
+            device_id: our_id,
+            name: format!("REACT (ID {})", our_id),
+            ip: "127.0.0.1".parse().unwrap(),
+            track_loaded: false,
+            is_playing: false,
+            is_looping: false,
+            is_master: false,
+            is_on_air: false,
+            bpm: None,
+            track_title: None,
+            track_artist: None,
+        }];
+
+        devices.extend(state.devices.values()
+            .filter(|d| d.device_id != our_id)
+            .map(|d| {
+                let key = MetadataKey {
+                    device_id: d.status.track_device_id,
+                    slot: d.status.track_slot,
+                    track_id: d.status.track_id,
+                };
+                let metadata = state.metadata_cache.get(&key);
+                CdjDeviceInfo {
+                    device_id: d.device_id,
+                    name: d.name.clone(),
+                    ip: d.ip,
+                    track_loaded: d.status.track_loaded,
+                    is_playing: d.status.is_playing,
+                    is_looping: d.status.is_looping,
+                    is_master: d.status.is_master,
+                    is_on_air: d.status.is_on_air,
+                    bpm: d.status.bpm,
+                    track_title: metadata.map(|m| m.title.clone()),
+                    track_artist: metadata.map(|m| m.artist.clone()),
+                }
+            })
+        );
+
+        devices.sort_by_key(|d| d.device_id);
+
+        let master = state.devices.values()
+            .find(|d| d.status.is_master && d.status.track_loaded);
+
+        let current_track = master.map(|m| {
+            let key = MetadataKey {
+                device_id: m.status.track_device_id,
+                slot: m.status.track_slot,
+                track_id: m.status.track_id,
+            };
+            let metadata = state.metadata_cache.get(&key).cloned();
+            TrackInfo {
+                title: metadata.as_ref()
+                    .map(|m| m.title.clone())
+                    .unwrap_or_else(|| format!("Track {}", m.status.track_id)),
+                artist: metadata
+                    .as_ref()
+                    .map(|m| m.artist.clone())
+                    .unwrap_or_else(|| m.name.clone()),
+                album: metadata.as_ref().and_then(|m| m.album.clone()),
+                duration: metadata.as_ref().and_then(|m| m.duration),
+                position: None,
+                is_playing: m.status.is_playing,
+                bpm: m.status.bpm,
+                source: "Pioneer CDJ".to_string(),
+                deck: Some(m.device_id),
+                artwork: None,
+            }
+        });
+
+        let master_bpm = master.and_then(|m| m.status.bpm);
+
+        ProDjSnapshot {
+            devices,
+            master_bpm,
+            current_track,
+        }
+    }
+
+    /// Trigger metadata fetches for all loaded tracks that lack metadata.
+    fn trigger_pending_fetches(
+        state: &Arc<Mutex<ProDjLinkState>>,
+        fetch_thread_count: &Arc<AtomicUsize>,
+        snapshot: &Arc<RwLock<Arc<ProDjSnapshot>>>,
+    ) {
+        let devices_needing_fetch: Vec<(IpAddr, MetadataKey, u8)> = {
+            let state = state.lock();
+            let pending = state.pending_fetches.clone();
+            state.devices.values()
+                .filter(|d| d.status.track_loaded && d.status.track_id != 0)
+                .filter_map(|d| {
+                    let key = MetadataKey {
+                        device_id: d.status.track_device_id,
+                        slot: d.status.track_slot,
+                        track_id: d.status.track_id,
+                    };
+                    if !state.metadata_cache.contains_key(&key) && !pending.contains(&key) {
+                        let source_ip = state.devices.get(&d.status.track_device_id)
+                            .map(|src| src.ip)
+                            .unwrap_or(d.ip);
+                        Some((source_ip, key, d.device_id))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+
+        for (device_ip, key, playing_device_id) in devices_needing_fetch {
+            Self::start_metadata_fetch_impl(state, fetch_thread_count, snapshot, device_ip, key, playing_device_id);
+        }
+    }
+
     /// Parse a CDJ status packet (type 0x0a on port 50002)
     fn parse_cdj_status(
         data: &[u8],
         src_ip: IpAddr,
         state: &Arc<Mutex<ProDjLinkState>>,
         track_history: &Arc<Mutex<VecDeque<TrackChangeRecord>>>,
+        snapshot: &Arc<RwLock<Arc<ProDjSnapshot>>>,
     ) {
         // CDJ status packets vary in length - minimum ~0x7C needed for basic info
         if data.len() < 0x7C {
@@ -758,7 +902,7 @@ impl ProDjLinkClient {
         };
 
         // Quick lock to check state and update - minimize lock duration
-        let (is_new, track_changed, cached_title, cached_artist) = {
+        let (is_new, track_changed, _state_changed, cached_title, cached_artist) = {
             let mut state = state.lock();
             let is_new = !state.devices.contains_key(&device_id);
 
@@ -788,14 +932,18 @@ impl ProDjLinkClient {
                 (None, None)
             };
 
+            let mut state_changed = is_new || track_changed;
+
             // Update device state — avoid per-packet String allocation when nothing changed
             if let Some(existing) = state.devices.get_mut(&device_id) {
                 existing.last_seen = Instant::now();
                 if existing.status != new_status {
                     existing.status = new_status;
+                    state_changed = true;
                 }
                 if existing.name != name {
                     existing.name = name.clone();
+                    state_changed = true;
                 }
             } else {
                 state.devices.insert(
@@ -808,9 +956,15 @@ impl ProDjLinkClient {
                         status: new_status,
                     },
                 );
+                state_changed = true;
             }
 
-            (is_new, track_changed, cached_title, cached_artist)
+            if state_changed {
+                let snap = Self::build_snapshot(&state);
+                *snapshot.write() = Arc::new(snap);
+            }
+
+            (is_new, track_changed, state_changed, cached_title, cached_artist)
         }; // state lock released here
 
         // Record track change AFTER releasing state lock (separate lock)
@@ -1430,20 +1584,27 @@ impl ProDjLinkClient {
 
     /// Start a background metadata fetch for a track
     /// Includes debouncing: waits 300ms after track change to avoid mid-load fetches
-    fn start_metadata_fetch(&self, device_ip: IpAddr, key: MetadataKey, source_device_id: u8) {
+    fn start_metadata_fetch_impl(
+        state: &Arc<Mutex<ProDjLinkState>>,
+        fetch_thread_count: &Arc<AtomicUsize>,
+        snapshot: &Arc<RwLock<Arc<ProDjSnapshot>>>,
+        device_ip: IpAddr,
+        key: MetadataKey,
+        source_device_id: u8,
+    ) {
         // Debounce delay in ms - CDJs can be mid-load when we first see track change
         const DEBOUNCE_DELAY_MS: u64 = 300;
         const MAX_FETCH_THREADS: usize = 4;
         const MAX_PENDING_FETCHES: usize = 32;
 
         // Reject if we're already at the thread limit
-        if self.fetch_thread_count.load(Ordering::Relaxed) >= MAX_FETCH_THREADS {
+        if fetch_thread_count.load(Ordering::Relaxed) >= MAX_FETCH_THREADS {
             log::trace!("[ProDjLink] Dropping metadata fetch for track {}: thread cap reached", key.track_id);
             return;
         }
 
         {
-            let state = self.state.lock();
+            let state = state.lock();
             if state.pending_fetches.contains(&key) || state.metadata_cache.contains_key(&key) {
                 return;
             }
@@ -1460,7 +1621,7 @@ impl ProDjLinkClient {
 
         // Insert pending after debounce check
         {
-            let mut state = self.state.lock();
+            let mut state = state.lock();
             if state.pending_fetches.len() >= MAX_PENDING_FETCHES {
                 log::trace!("[ProDjLink] Dropping metadata fetch for track {}: pending cap reached", key.track_id);
                 return;
@@ -1468,10 +1629,11 @@ impl ProDjLinkClient {
             state.pending_fetches.insert(key.clone());
         }
 
-        self.fetch_thread_count.fetch_add(1, Ordering::Relaxed);
-        let state = self.state.clone();
+        fetch_thread_count.fetch_add(1, Ordering::Relaxed);
+        let state = state.clone();
         let key_clone = key.clone();
-        let thread_count = self.fetch_thread_count.clone();
+        let thread_count = fetch_thread_count.clone();
+        let thread_snapshot = snapshot.clone();
 
         thread::Builder::new()
             .name(format!("prodjlink-metadata-{}", key.track_id))
@@ -1509,6 +1671,9 @@ impl ProDjLinkClient {
                         }
                     }
                     state.metadata_cache.insert(key_clone, m);
+                    // Update snapshot so the engine sees new metadata immediately
+                    let snap = Self::build_snapshot(&state);
+                    *thread_snapshot.write() = Arc::new(snap);
                 } else {
                     log::debug!(
                         "[ProDjLink] No metadata found for track {}",
@@ -1517,6 +1682,17 @@ impl ProDjLinkClient {
                 }
             })
             .ok();
+    }
+
+    fn start_metadata_fetch(&self, device_ip: IpAddr, key: MetadataKey, source_device_id: u8) {
+        Self::start_metadata_fetch_impl(
+            &self.state,
+            &self.fetch_thread_count,
+            &self.snapshot,
+            device_ip,
+            key,
+            source_device_id,
+        );
     }
 }
 
@@ -1589,6 +1765,12 @@ impl ProDjLinkClient {
             deck: Some(device_id),
             artwork: None,
         })
+    }
+
+    /// Return a lock-free snapshot of the current ProDJ Link state.
+    /// This clones an Arc pointer — no mutex acquisition on the read path.
+    pub fn snapshot(&self) -> Arc<ProDjSnapshot> {
+        self.snapshot.read().clone()
     }
 
     /// Check whether any CDJ devices are currently visible.
