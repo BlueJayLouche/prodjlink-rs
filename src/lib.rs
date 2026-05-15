@@ -144,7 +144,7 @@ struct CDJDevice {
     status: DeckStatus,
 }
 
-#[derive(Default, Clone, Debug)]
+#[derive(Default, Clone, Debug, PartialEq)]
 struct DeckStatus {
     track_loaded: bool,
     is_playing: bool,
@@ -775,17 +775,27 @@ impl ProDjLinkClient {
                 (None, None)
             };
 
-            // Update device state
-            state.devices.insert(
-                device_id,
-                CDJDevice {
+            // Update device state — avoid per-packet String allocation when nothing changed
+            if let Some(existing) = state.devices.get_mut(&device_id) {
+                existing.last_seen = Instant::now();
+                if existing.status != new_status {
+                    existing.status = new_status;
+                }
+                if existing.name != name {
+                    existing.name = name.clone();
+                }
+            } else {
+                state.devices.insert(
                     device_id,
-                    name: name.clone(),
-                    ip: src_ip,
-                    last_seen: Instant::now(),
-                    status: new_status,
-                },
-            );
+                    CDJDevice {
+                        device_id,
+                        name: name.clone(),
+                        ip: src_ip,
+                        last_seen: Instant::now(),
+                        status: new_status,
+                    },
+                );
+            }
 
             (is_new, track_changed, cached_title, cached_artist)
         }; // state lock released here
