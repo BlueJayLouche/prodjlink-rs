@@ -223,19 +223,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "prodjlink-rs"
-version = "0.1.0"
-dependencies = [
- "env_logger",
- "if-addrs",
- "libc",
- "log",
- "parking_lot",
- "serde",
- "socket2",
-]
-
-[[package]]
 name = "quote"
 version = "1.0.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -281,6 +268,19 @@ name = "regex-syntax"
 version = "0.8.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
+
+[[package]]
+name = "rustjay-prodjlink"
+version = "0.1.0"
+dependencies = [
+ "env_logger",
+ "if-addrs",
+ "libc",
+ "log",
+ "parking_lot",
+ "serde",
+ "socket2",
+]
 
 [[package]]
 name = "scopeguard"
