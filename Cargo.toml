@@ -1,11 +1,11 @@
 [package]
-name = "prodjlink-rs"
+name = "rustjay-prodjlink"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.75.0"
-description = "Rust client for Pioneer/AlphaTheta Pro DJ Link status and metadata monitoring"
+description = "Rust client for Pioneer/AlphaTheta Pro DJ Link status and metadata monitoring (rustjay fork of prodjlink-rs)"
 license = "MIT"
-repository = "https://github.com/Compellerai/prodjlink-rs"
+repository = "https://github.com/BlueJayLouche/prodjlink-rs"
 homepage = "https://github.com/Compellerai/prodjlink-rs"
 readme = "README.md"
 keywords = ["prodjlink", "pioneer", "cdj", "dj", "rekordbox"]
@@ -27,3 +27,6 @@ fuzz = []
 
 [dev-dependencies]
 env_logger = "0.11"
+
+[lib]
+name = "prodjlink_rs"
